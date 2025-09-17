@@ -74,49 +74,27 @@ class NorfairTracker(BaseTracker):
         self.distance_threshold = distance_threshold
         self.hit_counter_max = hit_counter_max
         self.initialization_delay = initialization_delay
-        
-        # Create custom distance function that handles Detection objects properly
-        def custom_distance_function(detection, tracked_object):
-            """Custom distance function that converts Detection objects to proper format."""
-            try:
-                # Extract bounding boxes from Detection objects
-                if hasattr(detection, 'points') and len(detection.points) >= 2:
-                    det_x1, det_y1 = detection.points[0]
-                    det_x2, det_y2 = detection.points[1]
-                    det_bbox = np.array([det_x1, det_y1, det_x2, det_y2], dtype=np.float32)
-                else:
-                    return float('inf')  # Invalid detection
-                
-                if hasattr(tracked_object, 'last_detection') and tracked_object.last_detection is not None:
-                    if hasattr(tracked_object.last_detection, 'points') and len(tracked_object.last_detection.points) >= 2:
-                        track_x1, track_y1 = tracked_object.last_detection.points[0]
-                        track_x2, track_y2 = tracked_object.last_detection.points[1]
-                        track_bbox = np.array([track_x1, track_y1, track_x2, track_y2], dtype=np.float32)
-                    else:
-                        return float('inf')  # Invalid tracked object
-                else:
-                    return float('inf')  # No last detection
-                
-                # Calculate IoU distance
-                if distance_function == "iou":
-                    return self._calculate_iou_distance(det_bbox, track_bbox)
-                else:
-                    return self._calculate_euclidean_distance(det_bbox, track_bbox)
-                    
-            except Exception as e:
-                logger.warning(f"Distance calculation failed: {e}")
-                return float('inf')
-        
-        self.distance_function = custom_distance_function
-        
-        self.tracker = norfair.Tracker(
-            distance_function=self.distance_function,
-            distance_threshold=distance_threshold,
-            hit_counter_max=hit_counter_max,
-            initialization_delay=initialization_delay,
-        )
-        
-        logger.info(f"Initialized Norfair tracker with custom {distance_function} distance")
+
+        # Use Norfair's vectorized built-in distance functions to avoid scalar warnings
+        # Prefer optimized IoU if requested; fallback to 'euclidean' otherwise
+        try:
+            df = 'iou' if distance_function in ("iou", "iou_opt") else 'euclidean'
+            self.tracker = norfair.Tracker(
+                distance_function=df,
+                distance_threshold=distance_threshold,
+                hit_counter_max=hit_counter_max,
+                initialization_delay=initialization_delay,
+            )
+            logger.info(f"Initialized Norfair tracker with vectorized '{df}' distance")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Norfair with vectorized distance ({distance_function}): {e}. Falling back to default.")
+            self.tracker = norfair.Tracker(
+                distance_function='euclidean',
+                distance_threshold=distance_threshold,
+                hit_counter_max=hit_counter_max,
+                initialization_delay=initialization_delay,
+            )
+            logger.info("Initialized Norfair tracker with vectorized 'euclidean' distance")
     
     def _calculate_iou_distance(self, bbox1: np.ndarray, bbox2: np.ndarray) -> float:
         """Calculate IoU-based distance between two bounding boxes."""

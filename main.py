@@ -19,7 +19,7 @@ from detector import PersonDetector
 from tracker import TrackerManager
 from counter import PeopleCounter, CrossingLine
 from db import CounterDB
-from api import PeopleCounterAPI
+from flask_api import PeopleCounterAPI
 
 # Configure logging
 def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
@@ -78,7 +78,11 @@ class PeopleCounterSystem:
         self.running = False
         self.processing_thread: Optional[threading.Thread] = None
         self.api_thread: Optional[threading.Thread] = None
-        self.show_window = True  # Enable camera window display
+        self.show_window = False  # Disable camera window display for web UI
+        
+        # Frame buffer for web streaming
+        self.current_frame = None
+        self.frame_lock = threading.Lock()
         
         # Statistics
         self.stats = {
@@ -88,6 +92,8 @@ class PeopleCounterSystem:
             'start_time': time.time(),
             'fps': 0.0
         }
+        # Last frame timestamp for FPS
+        self._last_frame_time: Optional[float] = None
         
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -132,7 +138,7 @@ class PeopleCounterSystem:
                 'enable': True
             },
             'display': {
-                'show_window': True,
+                'show_window': False,
                 'window_name': 'People Counter',
                 'window_width': 800,
                 'window_height': 600
@@ -337,7 +343,7 @@ class PeopleCounterSystem:
         
         # Initialize display window if enabled
         display_config = self.config.get('display', {})
-        show_window = display_config.get('show_window', True)
+        show_window = display_config.get('show_window', False)
         window_name = display_config.get('window_name', 'People Counter')
         
         if show_window:
@@ -345,7 +351,6 @@ class PeopleCounterSystem:
             self.logger.info(f"Camera window '{window_name}' initialized")
         
         frame_count = 0
-        fps_start_time = time.time()
         
         while self.running:
             try:
@@ -382,33 +387,39 @@ class PeopleCounterSystem:
                     self.logger.warning(f"Counter update failed: {e}")
                     crossings = []
                 
-                # Log crossings to database
+                # Log crossings to database with error isolation per event
                 for crossing in crossings:
-                    await self.db.log_crossing(
-                        track_id=crossing['track_id'],
-                        direction=crossing['direction'],
-                        confidence=crossing['confidence'],
-                        x=crossing['position'][0],
-                        y=crossing['position'][1],
-                        frame_number=crossing.get('frame_number')
-                    )
+                    try:
+                        await self.db.log_crossing(
+                            track_id=crossing['track_id'],
+                            direction=crossing['direction'],
+                            confidence=crossing['confidence'],
+                            x=crossing['position'][0],
+                            y=crossing['position'][1],
+                            frame_number=crossing.get('frame_number')
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to log crossing to DB: {e}")
                     
-                    # Broadcast to API clients
-                    if self.api:
-                        await self.api.broadcast_crossing(crossing)
+                    # Broadcast to API clients (best-effort)
+                    try:
+                        if self.api:
+                            await self.api.broadcast_crossing(crossing)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to broadcast crossing: {e}")
                 
                 self.stats['crossings_count'] += len(crossings)
                 
-                # Update API with current counts
-                if self.api:
-                    counts = self.counter.get_counts()
-                    await self.api.update_counts(counts, self.stats['fps'])
-                
-                # Display frame with visualizations
-                if show_window:
+                # Draw overlays for the web view and store the frame for streaming
+                try:
                     display_frame = self._draw_visualizations(frame, detections, tracked_objects)
-                    
-                    # Resize for display if needed
+                    with self.frame_lock:
+                        self.current_frame = display_frame.copy()
+                except Exception as e:
+                    self.logger.warning(f"Failed to render display frame: {e}")
+                
+                # Optionally show OpenCV window if explicitly enabled in config
+                if show_window:
                     window_width = display_config.get('window_width', 800)
                     window_height = display_config.get('window_height', 600)
                     h, w = display_frame.shape[:2]
@@ -416,12 +427,9 @@ class PeopleCounterSystem:
                         scale = min(window_width/w, window_height/h)
                         new_w, new_h = int(w*scale), int(h*scale)
                         display_frame = cv2.resize(display_frame, (new_w, new_h))
-                    
                     cv2.imshow(window_name, display_frame)
-                    
-                    # Handle window events
                     key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q') or key == 27:  # 'q' or ESC key
+                    if key == ord('q') or key == 27:
                         self.logger.info("Window close requested")
                         self.stop()
                         break
@@ -430,16 +438,32 @@ class PeopleCounterSystem:
                 frame_count += 1
                 self.stats['frames_processed'] = frame_count
                 
-                # Calculate FPS every 30 frames
-                if frame_count % 30 == 0:
-                    elapsed = time.time() - fps_start_time
-                    self.stats['fps'] = 30.0 / elapsed if elapsed > 0 else 0.0
-                    fps_start_time = time.time()
+                # Update FPS every frame using exponential moving average for smoother UI
+                now = time.time()
+                if self._last_frame_time is None:
+                    self._last_frame_time = now
+                else:
+                    dt = now - self._last_frame_time
+                    self._last_frame_time = now
+                    if dt > 0:
+                        inst_fps = 1.0 / dt
+                        # EMA smoothing: 0.85 previous + 0.15 new
+                        self.stats['fps'] = 0.85 * self.stats['fps'] + 0.15 * inst_fps if self.stats['fps'] > 0 else inst_fps
                     
                     self.logger.debug(f"Processing: {self.stats['fps']:.1f} FPS, "
                                     f"Detections: {len(detections)}, "
                                     f"Tracks: {len(tracked_objects)}, "
                                     f"Crossings: {len(crossings)}")
+                
+                # Now that FPS is updated, send API metrics for this frame
+                if self.api:
+                    counts = self.counter.get_counts()
+                    await self.api.update_counts(
+                        counts,
+                        self.stats['fps'],
+                        detections=len(detections),
+                        tracks=len(tracked_objects)
+                    )
                 
                 # Small delay to prevent excessive CPU usage
                 await asyncio.sleep(0.001)
@@ -448,7 +472,7 @@ class PeopleCounterSystem:
                 self.logger.error(f"Error in processing loop: {e}")
                 await asyncio.sleep(1.0)  # Wait before retrying
         
-        # Clean up display window
+        # Clean up display window if used
         if show_window:
             cv2.destroyAllWindows()
         
@@ -480,9 +504,23 @@ class PeopleCounterSystem:
         
         # Start API server in separate thread
         if self.api:
+            # Provide frame source to API for MJPEG streaming
+            self.api.set_frame_source(self.get_current_frame)
             self.api_thread = threading.Thread(target=self._run_api_server, daemon=True)
             self.api_thread.start()
             self.logger.info(f"API server started on {self.config['api']['host']}:{self.config['api']['port']}")
+            
+            # Auto-open web browser to the UI
+            import webbrowser
+            def _open_browser():
+                try:
+                    time.sleep(2)
+                    url = f"http://localhost:{self.config['api']['port']}"
+                    webbrowser.open(url)
+                    self.logger.info(f"Opening web interface at {url}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to auto-open browser: {e}")
+            threading.Thread(target=_open_browser, daemon=True).start()
         
         # Start processing loop
         await self._processing_loop()
@@ -509,6 +547,11 @@ class PeopleCounterSystem:
         if self.counter:
             counts = self.counter.get_counts()
             self.logger.info(f"  Final counts: In={counts['in']}, Out={counts['out']}, Occupancy={counts['occupancy']}")
+
+    def get_current_frame(self):
+        """Return the latest processed frame for streaming (thread-safe)."""
+        with self.frame_lock:
+            return self.current_frame.copy() if self.current_frame is not None else None
 
 async def main():
     """Main entry point."""
