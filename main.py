@@ -20,6 +20,7 @@ from tracker import TrackerManager
 from counter import PeopleCounter, CrossingLine
 from db import CounterDB
 from flask_api import PeopleCounterAPI
+from recorder import ClipRecorder
 
 # Configure logging
 def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
@@ -83,6 +84,9 @@ class PeopleCounterSystem:
         # Frame buffer for web streaming
         self.current_frame = None
         self.frame_lock = threading.Lock()
+        
+        # Recorder for presence-based clips
+        self.recorder: Optional[ClipRecorder] = ClipRecorder(output_dir='recordings', idle_timeout=2.0)
         
         # Statistics
         self.stats = {
@@ -315,21 +319,20 @@ class PeopleCounterSystem:
             cv2.putText(display_frame, f'ID:{obj.track_id}', 
                        (x1, y2+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
-        # Draw counts
-        counts = self.counter.get_counts()
-        info_text = [
-            f"In: {counts['in']}",
-            f"Out: {counts['out']}", 
-            f"Occupancy: {counts['occupancy']}",
-            f"FPS: {self.stats['fps']:.1f}",
-            f"Detections: {len(detections)}",
-            f"Tracks: {len(tracked_objects)}"
-        ]
-        
-        for i, text in enumerate(info_text):
-            cv2.putText(display_frame, text, (10, 30 + i*25), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
+        # HUD metrics overlay disabled — metrics are shown in the web GUI
+        # counts = self.counter.get_counts()
+        # info_text = [
+        #     f"In: {counts['in']}",
+        #     f"Out: {counts['out']}", 
+        #     f"Occupancy: {counts['occupancy']}",
+        #     f"FPS: {self.stats['fps']:.1f}",
+        #     f"Detections: {len(detections)}",
+        #     f"Tracks: {len(tracked_objects)}"
+        # ]
+        # for i, text in enumerate(info_text):
+        #     cv2.putText(display_frame, text, (10, 30 + i*25), 
+        #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+         
         return display_frame
 
     async def _processing_loop(self):
@@ -455,6 +458,21 @@ class PeopleCounterSystem:
                                     f"Tracks: {len(tracked_objects)}, "
                                     f"Crossings: {len(crossings)}")
                 
+                # Presence-based clip recording (record while activity is present)
+                try:
+                    activity_present = (len(tracked_objects) > 0) or (len(detections) > 0)
+                    if activity_present and self.recorder is not None and 'display_frame' in locals() and display_frame is not None:
+                        h, w = display_frame.shape[:2]
+                        fps_for_record = float(self.stats['fps']) if self.stats['fps'] > 0 else 6.0
+                        self.recorder.start_if_needed(fps_for_record, (w, h), tag='cam1')
+                        self.recorder.write(display_frame)
+                        self.recorder.mark_active()
+                    else:
+                        if self.recorder is not None:
+                            self.recorder.maybe_stop()
+                except Exception as e:
+                    self.logger.warning(f"Recorder error: {e}")
+                
                 # Now that FPS is updated, send API metrics for this frame
                 if self.api:
                     counts = self.counter.get_counts()
@@ -534,6 +552,13 @@ class PeopleCounterSystem:
         # Stop video capture
         if self.capture:
             self.capture.stop()
+        
+        # Ensure recorder is closed
+        try:
+            if self.recorder is not None:
+                self.recorder.stop()
+        except Exception:
+            pass
         
         # Print final statistics
         elapsed = time.time() - self.stats['start_time']

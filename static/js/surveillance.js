@@ -109,6 +109,10 @@ class SurveillanceSystem {
                 await fetch('/api/health', { cache: 'no-store' });
             } catch (_) { /* noop */ }
         }, 10000);
+
+        // Periodically refresh recordings list
+        this.refreshRecordings();
+        setInterval(() => this.refreshRecordings(), 15000);
     }
 
     updateMetrics(data) {
@@ -181,6 +185,43 @@ class SurveillanceSystem {
             console.error('Failed to check system health:', error);
         }
     }
+
+    async refreshRecordings() {
+        const container = document.getElementById('recordings-list');
+        if (!container) return;
+        try {
+            const res = await fetch(`/api/recordings?t=${Date.now()}`, { cache: 'no-store' });
+            if (!res.ok) throw new Error('failed to list recordings');
+            const data = await res.json();
+            const clips = Array.isArray(data.clips) ? data.clips : [];
+            container.innerHTML = '';
+            if (clips.length === 0) {
+                container.innerHTML = '<div class="text-muted">No clips yet.</div>';
+                return;
+            }
+            // Render first 8 clips as cards
+            clips.slice(0, 8).forEach((clip) => {
+                const col = document.createElement('div');
+                col.className = 'col-md-3 mb-3';
+                col.innerHTML = `
+                    <div class="card" style="background:#1f2c3a;border:1px solid #34495e;">
+                        <div class="card-body p-2">
+                            <video controls preload="metadata" style="width:100%;border-radius:6px;background:#000;">
+                                <source src="${clip.url}" type="video/mp4">
+                                Your browser does not support the video tag.
+                            </video>
+                            <div class="small mt-2" style="opacity:0.8;">
+                                ${clip.filename}
+                            </div>
+                        </div>
+                    </div>`;
+                container.appendChild(col);
+            });
+        } catch (e) {
+            console.error('Failed to load recordings:', e);
+            container.innerHTML = '<div class="text-danger">Failed to load recordings.</div>';
+        }
+    }
 }
 
 // CSS animation for flash effect
@@ -197,4 +238,6 @@ document.head.appendChild(style);
 // Initialize the surveillance system when the page loads
 document.addEventListener('DOMContentLoaded', () => {
     window.surveillanceSystem = new SurveillanceSystem();
+    const btn = document.getElementById('btn-refresh-clips');
+    if (btn) btn.addEventListener('click', () => window.surveillanceSystem.refreshRecordings());
 });

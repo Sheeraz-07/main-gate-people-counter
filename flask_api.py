@@ -10,7 +10,7 @@ from typing import Callable, Dict, Optional
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, render_template, make_response
+from flask import Flask, Response, jsonify, render_template, make_response, send_from_directory, abort
 from flask_cors import CORS
 
 from db import CounterDB
@@ -126,6 +126,57 @@ class PeopleCounterAPI:
                 self._generate_frames(),
                 mimetype="multipart/x-mixed-replace; boundary=frame",
             )
+
+        @app.route("/api/recordings")
+        def list_recordings():
+            """Return JSON list of available video clips in the recordings directory."""
+            try:
+                import os
+                from pathlib import Path
+                rec_dir = Path("recordings")
+                rec_dir.mkdir(exist_ok=True)
+                entries = []
+                for name in os.listdir(rec_dir):
+                    path = rec_dir / name
+                    if not path.is_file():
+                        continue
+                    # Only allow common video extensions
+                    if path.suffix.lower() not in [".mp4", ".avi", ".mov", ".mkv"]:
+                        continue
+                    stat = path.stat()
+                    entries.append({
+                        "filename": name,
+                        "size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                        "url": f"/recordings/{name}",
+                    })
+                # Sort newest first
+                entries.sort(key=lambda e: e["mtime"], reverse=True)
+                resp = make_response(jsonify({"clips": entries}))
+                resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+                resp.headers["Pragma"] = "no-cache"
+                resp.headers["Expires"] = "0"
+                return resp
+            except Exception as e:
+                logger.error(f"Failed to list recordings: {e}")
+                return jsonify({"clips": []}), 200
+
+        @app.route("/recordings/<path:filename>")
+        def get_recording(filename: str):
+            """Serve a recording file safely from the recordings directory."""
+            from pathlib import Path
+            rec_dir = Path("recordings").resolve()
+            try:
+                # Basic path traversal protection
+                safe_path = (rec_dir / filename).resolve()
+                if not str(safe_path).startswith(str(rec_dir)):
+                    abort(404)
+                if not safe_path.exists() or not safe_path.is_file():
+                    abort(404)
+                return send_from_directory(rec_dir, safe_path.name, as_attachment=False)
+            except Exception as e:
+                logger.error(f"Failed to serve recording '{filename}': {e}")
+                abort(404)
 
     def _generate_frames(self):
         """Generator that yields JPEG-encoded frames as MJPEG stream."""
