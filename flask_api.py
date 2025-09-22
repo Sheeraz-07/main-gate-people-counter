@@ -10,7 +10,7 @@ from typing import Callable, Dict, Optional
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, render_template, make_response, send_from_directory, abort
+from flask import Flask, Response, jsonify, render_template, make_response, send_from_directory, abort, request
 from flask_cors import CORS
 
 from db import CounterDB
@@ -122,8 +122,21 @@ class PeopleCounterAPI:
 
         @app.route("/video/stream")
         def video_stream():
+            # Optional upscaling parameters: scale (float), width (int), height (int)
+            try:
+                scale = float(request.args.get("scale", "1.0"))
+            except Exception:
+                scale = 1.0
+            try:
+                max_w = request.args.get("width")
+                max_h = request.args.get("height")
+                max_w = int(max_w) if max_w else None
+                max_h = int(max_h) if max_h else None
+            except Exception:
+                max_w, max_h = None, None
+
             return Response(
-                self._generate_frames(),
+                self._generate_frames(scale=scale, max_width=max_w, max_height=max_h),
                 mimetype="multipart/x-mixed-replace; boundary=frame",
             )
 
@@ -133,6 +146,7 @@ class PeopleCounterAPI:
             try:
                 import os
                 from pathlib import Path
+                import time as _time
                 rec_dir = Path("recordings")
                 rec_dir.mkdir(exist_ok=True)
                 entries = []
@@ -140,10 +154,13 @@ class PeopleCounterAPI:
                     path = rec_dir / name
                     if not path.is_file():
                         continue
-                    # Only allow common video extensions
-                    if path.suffix.lower() not in [".mp4", ".avi", ".mov", ".mkv"]:
+                    # Prefer browser-playable clips: MP4 only
+                    if path.suffix.lower() not in [".mp4"]:
                         continue
                     stat = path.stat()
+                    # Skip files that are very recent to avoid Windows file lock while writing
+                    if (_time.time() - stat.st_mtime) < 2.0:
+                        continue
                     entries.append({
                         "filename": name,
                         "size": stat.st_size,
@@ -173,13 +190,30 @@ class PeopleCounterAPI:
                     abort(404)
                 if not safe_path.exists() or not safe_path.is_file():
                     abort(404)
-                return send_from_directory(rec_dir, safe_path.name, as_attachment=False)
+                # Determine MIME type explicitly for better compatibility
+                ext = safe_path.suffix.lower()
+                mimetype = "application/octet-stream"
+                if ext == ".mp4":
+                    mimetype = "video/mp4"
+                elif ext == ".avi":
+                    mimetype = "video/x-msvideo"
+                elif ext == ".mov":
+                    mimetype = "video/quicktime"
+                elif ext == ".mkv":
+                    mimetype = "video/x-matroska"
+
+                resp = send_from_directory(rec_dir, safe_path.name, as_attachment=False, mimetype=mimetype, conditional=True)
+                # Help some browsers with scrubbing
+                resp.headers["Accept-Ranges"] = "bytes"
+                return resp
             except Exception as e:
                 logger.error(f"Failed to serve recording '{filename}': {e}")
                 abort(404)
 
-    def _generate_frames(self):
-        """Generator that yields JPEG-encoded frames as MJPEG stream."""
+    def _generate_frames(self, scale: float = 1.0, max_width: Optional[int] = None, max_height: Optional[int] = None):
+        """Generator that yields JPEG-encoded frames as MJPEG stream.
+        Optionally upscales frames using either a scale factor or bounding box (max_width/height), preserving aspect ratio.
+        """
         while True:
             frame = None
             try:
@@ -201,10 +235,18 @@ class PeopleCounterAPI:
                     2,
                     cv2.LINE_AA,
                 )
-                ret, buffer = cv2.imencode(".jpg", placeholder, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                # Apply upscaling to placeholder too for consistency
+                img_out = placeholder
+                if max_width or max_height or (scale and scale != 1.0):
+                    img_out = self._resize_preserve_aspect(img_out, scale, max_width, max_height)
+                ret, buffer = cv2.imencode(".jpg", img_out, [cv2.IMWRITE_JPEG_QUALITY, 75])
             else:
+                # Optional upscaling without cropping
+                img_out = frame
+                if max_width or max_height or (scale and scale != 1.0):
+                    img_out = self._resize_preserve_aspect(img_out, scale, max_width, max_height)
                 # Reduce JPEG quality a bit to lower CPU and bandwidth
-                ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                ret, buffer = cv2.imencode(".jpg", img_out, [cv2.IMWRITE_JPEG_QUALITY, 75])
 
             if ret:
                 jpg = buffer.tobytes()
@@ -215,6 +257,42 @@ class PeopleCounterAPI:
 
             # Cap MJPEG at ~12 FPS to reduce CPU load
             time.sleep(1 / 12.0)
+
+    @staticmethod
+    def _resize_preserve_aspect(img: np.ndarray, scale: float, max_width: Optional[int], max_height: Optional[int]) -> np.ndarray:
+        try:
+            h, w = img.shape[:2]
+            if max_width or max_height:
+                # Compute target size keeping aspect ratio within bounds
+                target_w = w
+                target_h = h
+                if max_width and not max_height:
+                    ratio = max_width / float(w)
+                    target_w = max_width
+                    target_h = int(h * ratio)
+                elif max_height and not max_width:
+                    ratio = max_height / float(h)
+                    target_h = max_height
+                    target_w = int(w * ratio)
+                else:
+                    # Both provided: fit inside box
+                    ratio_w = max_width / float(w)
+                    ratio_h = max_height / float(h)
+                    ratio = min(ratio_w, ratio_h)
+                    target_w = int(w * ratio)
+                    target_h = int(h * ratio)
+                if target_w <= 0 or target_h <= 0:
+                    return img
+                return cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+            # Else, apply scale factor
+            s = float(scale) if scale else 1.0
+            if abs(s - 1.0) < 1e-3:
+                return img
+            new_w = max(1, int(w * s))
+            new_h = max(1, int(h * s))
+            return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        except Exception:
+            return img
 
     async def update_counts(self, counts: Dict[str, int], fps: float = 0.0, detections: int = 0, tracks: int = 0):
         """Update current counts, FPS, and instantaneous detections/tracks."""

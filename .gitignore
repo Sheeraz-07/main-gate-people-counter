@@ -38,6 +38,10 @@ counts.db
 logs/
 *.log
 
+# Recordings
+recordings/
+*.mp4
+
 # Model files (large binary files)
 models/
 *.onnx

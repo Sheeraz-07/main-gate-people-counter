@@ -65,6 +65,17 @@ class SurveillanceSystem {
                 this.updateConnectionStatus(true);
             };
         }
+
+        // Clips modal behaviors
+        const refreshBtn = document.getElementById('btn-refresh-clips-modal');
+        if (refreshBtn) refreshBtn.addEventListener('click', () => this.populateClipsList());
+        const modalEl = document.getElementById('clipsModal');
+        if (modalEl) {
+            modalEl.addEventListener('shown.bs.modal', () => this.populateClipsList());
+            modalEl.addEventListener('hidden.bs.modal', () => this.stopClipPlayback());
+        }
+        const openClipsBtn = document.getElementById('btn-open-clips');
+        if (openClipsBtn) openClipsBtn.addEventListener('click', () => this.populateClipsList());
     }
 
     updateClock() {
@@ -206,11 +217,8 @@ class SurveillanceSystem {
                 col.innerHTML = `
                     <div class="card" style="background:#1f2c3a;border:1px solid #34495e;">
                         <div class="card-body p-2">
-                            <video controls preload="metadata" style="width:100%;border-radius:6px;background:#000;">
-                                <source src="${clip.url}" type="video/mp4">
-                                Your browser does not support the video tag.
-                            </video>
-                            <div class="small mt-2" style="opacity:0.8;">
+                            <video controls playsinline preload="metadata" style="width:100%;border-radius:6px;background:#000;" src="${clip.url}"></video>
+                            <div class="small mt-2" style="opacity:0.8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${clip.filename}">
                                 ${clip.filename}
                             </div>
                         </div>
@@ -221,6 +229,67 @@ class SurveillanceSystem {
             console.error('Failed to load recordings:', e);
             container.innerHTML = '<div class="text-danger">Failed to load recordings.</div>';
         }
+    }
+
+    async populateClipsList() {
+        const list = document.getElementById('clips-list');
+        if (!list) return;
+        list.innerHTML = '<div class="text-muted p-2">Loading...</div>';
+        try {
+            const res = await fetch(`/api/recordings?t=${Date.now()}`, { cache: 'no-store' });
+            if (!res.ok) throw new Error('failed to list recordings');
+            const data = await res.json();
+            const clips = Array.isArray(data.clips) ? data.clips : [];
+            list.innerHTML = '';
+            if (clips.length === 0) {
+                list.innerHTML = '<div class="text-muted p-2">No clips yet.</div>';
+                return;
+            }
+            clips.forEach((clip, idx) => {
+                const a = document.createElement('a');
+                a.href = '#';
+                a.className = 'list-group-item list-group-item-action';
+                a.style.background = '#1f2c3a';
+                a.style.color = '#fff';
+                a.textContent = clip.filename;
+                a.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    this.playClip(clip.url);
+                    // Highlight selection
+                    list.querySelectorAll('.list-group-item').forEach(el => el.classList.remove('active'));
+                    a.classList.add('active');
+                });
+                if (idx === 0) {
+                    // Auto-select and play first
+                    setTimeout(() => a.click(), 0);
+                }
+                list.appendChild(a);
+            });
+        } catch (e) {
+            console.error('Failed to load clips list:', e);
+            list.innerHTML = '<div class="text-danger p-2">Failed to load clips.</div>';
+        }
+    }
+
+    playClip(url) {
+        const player = document.getElementById('clips-player');
+        if (!player) return;
+        try {
+            player.pause();
+            player.src = `${url}?t=${Date.now()}`; // cache-bust
+            player.load();
+            player.play().catch(() => {});
+        } catch (_) {}
+    }
+
+    stopClipPlayback() {
+        const player = document.getElementById('clips-player');
+        if (!player) return;
+        try {
+            player.pause();
+            player.removeAttribute('src');
+            player.load();
+        } catch (_) {}
     }
 }
 
